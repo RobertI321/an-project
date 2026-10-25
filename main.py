@@ -18,6 +18,8 @@ from src.genome import decode, describe
 from src.search import SEARCH_CLASSES, run_search
 from src.train import fitness, train_population
 
+
+# Load in config, create output folder, copy config.yaml there for reproducibility
 config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
 cfg = yaml.safe_load(open(config_path))
 out = Path("results") / time.strftime("%Y%m%d-%H%M%S")
