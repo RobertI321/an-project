@@ -1,0 +1,29 @@
+# Fast learners - experiment settings (quick version; full-run values in the comments).
+# Budgets are counted in training IMAGES seen, not steps.
+# The search space (genes + ranges) is defined in src/genome.py.
+# YAML gotcha: write 1.0e-3, not 1e-3 (PyYAML reads 1e-3 as text).
+
+dataset: fashion_mnist                    # fashion_mnist | mnist
+
+# --- search ---
+methods: [GA, MAP-Elites, Optuna TPE, Random search]
+budgets: [2560, 12800, 32000, 64000, 128000]  # training images per candidate
+seeds: [0, 1]                             # independent search runs. Full: [0, 1, 2, 3, 4]
+cpg: 24                                   # candidates per generation
+generations: 5                            # full: 20  ->  cpg * generations networks per search
+top_k: 5                                  # re-check the top 5 on fresh seeds ...
+recheck_seeds: 3                          # ... the best average is the winner
+
+# --- retraining the winners + baselines ---
+epochs: 2                                 # full: 20  (1 epoch = 50,000 images)
+final_seeds: 3                            # retrain each winner this many times, average
+eval_every: 640                           # validation accuracy every 640 images
+thresholds: [0.75, 0.80, 0.85]            # speed = images needed to reach these accuracies
+early_samples: 51200                      # "early phase" for the early AUC metric
+acc_at: 12800                             # acc@ metric = val accuracy after this many images
+good_cell_margin: 0.03                    # grid cell is "good" if within 3 points of the best
+
+baselines:
+  Adam 1e-3: {lr: 1.0e-3, optimizer: adam, batch_size: 128, layers: 2, width: 128, activation: relu}
+  Adam 3e-4: {lr: 3.0e-4, optimizer: adam, batch_size: 128, layers: 2, width: 128, activation: relu}
+  SGD 1e-2:  {lr: 1.0e-2, optimizer: sgd,  batch_size: 128, layers: 2, width: 128, activation: relu}

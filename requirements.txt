@@ -1,0 +1,7 @@
+jax
+optax
+optuna
+numpy
+scipy
+matplotlib
+pyyaml

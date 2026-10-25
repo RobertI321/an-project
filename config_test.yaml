@@ -1,0 +1,23 @@
+# Tiny test run (like TEST_RUN in the notebook) - checks everything works in a few minutes.
+# Results are meaningless.  Run:  python main.py config_test.yaml
+
+dataset: fashion_mnist
+methods: [GA, MAP-Elites, Optuna TPE, Random search]
+budgets: [2560, 12800]
+seeds: [0, 1]
+cpg: 24
+generations: 2
+top_k: 3
+recheck_seeds: 1
+
+epochs: 1
+final_seeds: 2
+eval_every: 640
+thresholds: [0.75, 0.80, 0.85]
+early_samples: 12800
+acc_at: 6400
+good_cell_margin: 0.03
+
+baselines:
+  Adam 1e-3: {lr: 1.0e-3, optimizer: adam, batch_size: 128, layers: 2, width: 128, activation: relu}
+  SGD 1e-2:  {lr: 1.0e-2, optimizer: sgd,  batch_size: 128, layers: 2, width: 128, activation: relu}
