@@ -1,159 +1,119 @@
-"""Metrics, statistical tests and plots for the retrained winners and baselines."""
-import matplotlib.pyplot as plt
+"""Turn the raw results into tables (pandas) and statistical tests."""
 import numpy as np
+import pandas as pd
 from scipy.stats import binomtest, mannwhitneyu
 
-from src.genome import GRID_BINS, decode, grid_cell
-
-COLOR = {"GA": "tab:red", "MAP-Elites": "tab:blue", "Optuna TPE": "tab:green", "Random search": "tab:gray"}
-MARKER = {"GA": "^", "MAP-Elites": "o", "Optuna TPE": "D", "Random search": "s"}
-BASE_STYLE = ["--", ":", "-."]
+ALPHA = 0.05
+CHANCE = 0.1          # accuracy of random guessing (10 classes)
 
 
-def add_metrics(configs, curves, test, cfg):
-    """curves: (networks, seeds, eval points), test: (networks, seeds). Averages over seeds."""
-    x = np.arange(1, curves.shape[2] + 1) * cfg["eval_every"]       # images seen at each eval point
-    cfg["_x"] = x
-    i_at, i_early = np.searchsorted(x, cfg["acc_at"]), np.searchsorted(x, cfg["early_samples"])
-    for c, cu, te in zip(configs, curves, test):
-        c["curve"], c["test"] = cu.mean(0), te.mean()
-        c["acc_at"] = cu[:, i_at].mean()
-        c["early_auc"] = cu[:, :i_early + 1].mean()                 # mean val acc in the early phase
-        for th in cfg["thresholds"]:                                # images to reach th (nan = never)
-            hit = cu >= th
-            c[f"to{th}"] = np.nanmean(np.where(hit.any(1), x[hit.argmax(1)], np.nan)) if hit.any() else np.nan
+def images_to_reach(curve, threshold, eval_every):
+    """Training images seen when the learning curve first reaches `threshold` (NaN = never)."""
+    hits = np.flatnonzero(curve >= threshold)
+    return (hits[0] + 1) * eval_every if len(hits) else np.nan
 
 
-def add_diversity(runs, cfg):
-    """H1b: put ALL networks each search trained into the same grid (not just the winner)."""
-    for B in cfg["budgets"]:
-        rs = [r for r in runs if r["budget"] == B]
-        best = max(r["F"].max() for r in rs)
-        for r in rs:
-            arch = np.full((GRID_BINS, GRID_BINS), -np.inf)
-            for g, f in zip(r["G"], r["F"]):
-                a, b = grid_cell(decode(g))
-                arch[a, b] = max(arch[a, b], f)
-            r["qd_score"] = np.sum(arch[np.isfinite(arch)] - 0.1)    # 0.1 = chance accuracy
-            r["good_cells"] = int(np.sum(arch >= best - cfg["good_cell_margin"]))
+def network_table(networks, cfg):
+    """One row per retrained network: its hyperparameters, speed and accuracy (averaged over retraining seeds).
+
+    speed_to_XX%  images needed to reach XX% val accuracy (average of the seeds that got there; empty = none did)
+    acc_at        val accuracy after `acc_at` images
+    early_auc     average val accuracy over the first `early_images` images (one number for early speed)
+    final_val     val accuracy at the end of retraining
+    test_acc      test accuracy at the end of retraining
+    """
+    every, a = cfg["retrain"]["eval_every"], cfg["analysis"]
+    rows = []
+    for net in networks:
+        curves = net["seed_curves"]
+        row = {"name": net["name"], "method": net["method"], "budget": net["budget"], "seed": net["seed"], **net["hp"]}
+        for th in a["thresholds"]:
+            images = np.array([images_to_reach(c, th, every) for c in curves], dtype=float)
+            row[f"speed_to_{th:.0%}"] = np.nanmean(images) if np.isfinite(images).any() else np.nan
+        row["acc_at"] = curves[:, a["acc_at"] // every - 1].mean()
+        row["early_auc"] = curves[:, :a["early_images"] // every].mean()
+        row["final_val"] = curves[:, -1].mean()
+        row["test_acc"] = net["test_accuracy"]
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df["budget"] = df["budget"].astype("Int64")
+    df["seed"] = df["seed"].astype("Int64")
+    return df
 
 
-def report(configs, cfg):
-    bases = [c for c in configs if c["method"] == "Baseline"]
-    runs = [c for c in configs if c["method"] != "Baseline"]
-    sel = lambda B=None, m=None, key=None: np.array(
-        [r[key] for r in runs if B in (None, r["budget"]) and m in (None, r["method"])], float)
-    ms = lambda v: f"{np.nanmean(v):.4f} ± {np.nanstd(v):.4f}"
-    ths = cfg["thresholds"]
-
-    out = ["Speed = images to reach each validation accuracy (* = runs that never did)",
-           f"{'budget':<8}{'method':<15}" + "".join(f"{'to ' + format(t, '.0%'):>10}" for t in ths)
-           + f"{'acc@' + str(cfg['acc_at']):>17}{'early AUC':>17}{'final test':>17}{'QD-score':>10}{'good cells':>11}"]
-
-    def row(B, m, rs):
-        speed = ""
-        for t in ths:
-            v = np.array([r[f"to{t}"] for r in rs], float)
-            speed += f"{(f'{np.nanmean(v):.0f}' if np.isfinite(v).any() else 'never') + '*' * np.isnan(v).sum():>10}"
-        div = (f"{np.mean([r['qd_score'] for r in rs]):>10.1f}{np.mean([r['good_cells'] for r in rs]):>11.1f}"
-               if "qd_score" in rs[0] else "")
-        return (f"{B:<8}{m:<15}{speed}{ms([r['acc_at'] for r in rs]):>17}"
-                f"{ms([r['early_auc'] for r in rs]):>17}{ms([r['test'] for r in rs]):>17}{div}")
-
-    for b in bases:
-        out.append(row("-", b["name"], [b]))
-    for B in cfg["budgets"]:
-        for m in cfg["methods"]:
-            out.append(row(B, m, [r for r in runs if r["budget"] == B and r["method"] == m]))
-
-    def greater(a, b, label):  # one-sided Mann-Whitney U, one value per search run
-        if len(a) > 1 and len(b) > 1:
-            p = mannwhitneyu(a, b, alternative="greater").pvalue
-            out.append(f"  {label:<55} p = {p:.4f} {'*' if p < .05 else ''}")
-
-    short, long = cfg["budgets"][0], cfg["budgets"][-1]
-    out.append("\nH1  winners learn faster than the baselines (sign test on early AUC):")
-    for b in bases:
-        for B in cfg["budgets"]:
-            v = sel(B, key="early_auc")
-            k = int(np.sum(v > b["early_auc"]))
-            p = binomtest(k, len(v), .5, alternative="greater").pvalue
-            out.append(f"  vs {b['name']:<10} budget {B:<7}: {k}/{len(v)} winners faster   p = {p:.4f}")
-    out.append("H1  short-budget winners learn faster early than long-budget winners:")
-    for m in [None] + cfg["methods"]:
-        greater(sel(short, m, "early_auc"), sel(long, m, "early_auc"), f"{m or 'ALL'}: early AUC {short} > {long}")
-    out.append("H2  ... but reach lower final accuracy:")
-    for m in [None] + cfg["methods"]:
-        greater(sel(long, m, "test"), sel(short, m, "test"), f"{m or 'ALL'}: test acc {long} > {short}")
-    out.append("Search methods vs random search (early AUC):")
-    for B in cfg["budgets"]:
-        for m in [m for m in cfg["methods"] if m != "Random search"]:
-            greater(sel(B, m, "early_auc"), sel(B, "Random search", "early_auc"), f"budget {B}: {m} > Random")
-    out.append("H1b MAP-Elites finds more diverse good networks:")
-    for B in cfg["budgets"]:
-        greater(sel(B, "MAP-Elites", "qd_score"), sel(B, "Random search", "qd_score"),
-                f"budget {B}: QD-score MAP-Elites > Random")
-    return "\n".join(out)
+def diversity_table(runs, space, cfg):
+    """H1b: put ALL networks each search trained into the same grid (not only the winner).
+    coverage = share of grid cells used, qd_score = sum over used cells of (best accuracy - chance),
+    good_cells = cells with a network within `good_cell_margin` of the best accuracy at that budget."""
+    best_per_budget = {b: max(r["fitness"].max() for r in runs if r["budget"] == b) for b in cfg["run"]["budgets"]}
+    rows = []
+    for run in runs:
+        grid = np.full((space.grid_bins, space.grid_bins), np.nan)
+        for genome, score in zip(run["genomes"], run["fitness"]):
+            row, col = space.grid_cell(space.decode(genome))
+            grid[row, col] = np.fmax(grid[row, col], score)
+        used = grid[~np.isnan(grid)]
+        rows.append({"budget": run["budget"], "method": run["method"], "seed": run["seed"],
+                     "coverage": len(used) / grid.size,
+                     "qd_score": np.sum(used - CHANCE),
+                     "good_cells": int(np.sum(used >= best_per_budget[run["budget"]] - cfg["analysis"]["good_cell_margin"]))})
+    return pd.DataFrame(rows)
 
 
-def plot(configs, cfg):
-    bases = [c for c in configs if c["method"] == "Baseline"]
-    runs = [c for c in configs if c["method"] != "Baseline"]
-    budgets, methods, x = cfg["budgets"], cfg["methods"], cfg["_x"]
-    bcol = {B: plt.get_cmap("viridis")(i / max(1, len(budgets) - 1) * .85) for i, B in enumerate(budgets)}
-    fig, ax = plt.subplots(2, 3, figsize=(20, 10.5))
-    ax = ax.ravel()
+def summary_table(df, diversity):
+    """Averages of the winners per (budget, method), with the diversity columns added."""
+    metrics = [c for c in df.columns if c.startswith("speed_to")] + ["acc_at", "early_auc", "final_val", "test_acc"]
+    winners = df[df["method"] != "Baseline"].groupby(["budget", "method"])[metrics].mean()
+    div = diversity.groupby(["budget", "method"])[["coverage", "qd_score", "good_cells"]].mean()
+    return winners.join(div)
 
-    for B in budgets:                                                # (a) learning curves
-        C = np.stack([r["curve"] for r in runs if r["budget"] == B])
-        ax[0].plot(x, C.mean(0), color=bcol[B], lw=2, label=f"winners of {B}-image search")
-        ax[0].fill_between(x, C.mean(0) - C.std(0), C.mean(0) + C.std(0), color=bcol[B], alpha=.15)
-    for b, ls in zip(bases, BASE_STYLE):
-        ax[0].plot(x, b["curve"], "k", ls=ls, lw=2, label=f"baseline {b['name']}")
-    ax[0].axvline(cfg["early_samples"], color="gray", ls=":")
-    ax[0].set(xscale="log", xlabel="training images (log)", ylabel="validation accuracy",
-              title="(a) Learning curves of winners")
-    ax[0].legend(fontsize=8)
 
-    for k, m in enumerate(methods):                                  # (b) early AUC
-        for i, B in enumerate(budgets):
-            v = [r["early_auc"] for r in runs if r["budget"] == B and r["method"] == m]
-            xs = i + (k - 1.5) * .18
-            ax[1].scatter([xs] * len(v), v, color=COLOR[m], marker=MARKER[m], label=m if i == 0 else None)
-            ax[1].hlines(np.mean(v), xs - .07, xs + .07, color=COLOR[m], lw=2)
-    for b, ls in zip(bases, BASE_STYLE):
-        ax[1].axhline(b["early_auc"], color="k", ls=ls, label=f"baseline {b['name']}")
-    ax[1].set_xticks(range(len(budgets)), [str(B) for B in budgets])
-    ax[1].set(xlabel="search budget (images)", ylabel="early AUC", title="(b) H1: early learning speed")
-    ax[1].legend(fontsize=8)
+def hypothesis_tests(df, diversity, cfg):
+    """All statistical tests in one table. One data point = one search run (one winner)."""
+    winners, baselines = df[df["method"] != "Baseline"], df[df["method"] == "Baseline"]
+    budgets, methods = cfg["run"]["budgets"], cfg["search"]["methods"]
+    short, long = budgets[0], budgets[-1]
+    rows = []
 
-    for r in runs:                                                   # (c) trade-off
-        ax[2].scatter(r["early_auc"], r["test"], color=bcol[r["budget"]], marker=MARKER[r["method"]], s=50)
-    for b in bases:
-        ax[2].scatter(b["early_auc"], b["test"], marker="*", s=300, c="k")
-        ax[2].annotate(b["name"], (b["early_auc"], b["test"]), fontsize=8)
-    for B in budgets:
-        ax[2].scatter([], [], color=bcol[B], label=f"{B}-image winners")
-    ax[2].set(xlabel="early AUC (speed)", ylabel="final test accuracy", title="(c) H2: do fast learners pay?")
-    ax[2].legend(fontsize=8)
+    def add(hypothesis, comparison, result, p):
+        rows.append({"hypothesis": hypothesis, "comparison": comparison, "result": result,
+                     "p": p, "significant": bool(p < ALPHA)})
 
-    gens = np.arange(1, cfg["generations"] + 1) * cfg["cpg"]         # (d) search progress
-    for m in methods:
-        best = np.array([r["best"] for r in runs if r["budget"] == budgets[0] and r["method"] == m])
-        ax[3].plot(gens, best.mean(0), color=COLOR[m], marker=MARKER[m], label=m)
-    ax[3].set(xlabel="networks trained", ylabel="best fitness so far",
-              title=f"(d) Better than random? (budget {budgets[0]})")
-    ax[3].legend()
+    def greater(hypothesis, comparison, a, b):
+        """One-sided Mann-Whitney U: are the values in a larger than in b?"""
+        if len(a) >= 2 and len(b) >= 2:
+            add(hypothesis, comparison, f"{np.mean(a):.4f} vs {np.mean(b):.4f}",
+                mannwhitneyu(a, b, alternative="greater").pvalue)
 
-    w = .8 / len(methods)                                            # (e) QD-score
-    for k, m in enumerate(methods):
-        v = [[r["qd_score"] for r in runs if r["budget"] == B and r["method"] == m] for B in budgets]
-        ax[4].bar(np.arange(len(budgets)) + (k - 1.5) * w, [np.mean(a) for a in v], w,
-                  yerr=[np.std(a) for a in v], color=COLOR[m], label=m, capsize=3)
-    ax[4].set_xticks(range(len(budgets)), [str(B) for B in budgets])
-    ax[4].set(xlabel="search budget (images)", ylabel="QD-score", title="(e) H1b: diversity of good networks")
-    ax[4].legend()
+    # H1 (a): winners are faster early than the best baseline -> sign test: how many of them beat it?
+    best_baseline = baselines["early_auc"].max()
+    for label, group in [("all budgets", winners)] + [(f"budget {b}", winners[winners["budget"] == b]) for b in budgets]:
+        k, n = int((group["early_auc"] > best_baseline).sum()), len(group)
+        add("H1 faster than best baseline", label, f"{k}/{n} winners faster",
+            binomtest(k, n, 0.5, alternative="greater").pvalue)
 
-    ax[5].axis("off")
-    fig.tight_layout()
-    return fig
+    if short != long:
+        sel = lambda b, m=None: winners[(winners["budget"] == b) & ((winners["method"] == m) if m else True)]
+        # H1 (b): short-budget winners are faster early than long-budget winners
+        for m in [None] + methods:
+            greater("H1 short budget faster early", f"{m or 'all methods'}: {short} > {long}",
+                    sel(short, m)["early_auc"], sel(long, m)["early_auc"])
+        # H2: ... but end with lower final accuracy
+        for m in [None] + methods:
+            greater("H2 long budget better at the end", f"{m or 'all methods'}: {long} > {short}",
+                    sel(long, m)["test_acc"], sel(short, m)["test_acc"])
+
+    # Search methods vs random search (early speed of their winners)
+    for b in budgets:
+        at_b = winners[winners["budget"] == b]
+        for m in [m for m in methods if m != "Random search"]:
+            greater("Method beats random search", f"budget {b}: {m}",
+                    at_b[at_b["method"] == m]["early_auc"], at_b[at_b["method"] == "Random search"]["early_auc"])
+
+    # H1b: MAP-Elites finds more diverse good networks
+    for b in budgets:
+        at_b = diversity[diversity["budget"] == b]
+        greater("H1b MAP-Elites more diverse", f"budget {b}: QD-score",
+                at_b[at_b["method"] == "MAP-Elites"]["qd_score"], at_b[at_b["method"] == "Random search"]["qd_score"])
+
+    return pd.DataFrame(rows)

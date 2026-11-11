@@ -1,29 +1,69 @@
-# Fast learners - experiment settings (quick version; full-run values in the comments).
-# Budgets are counted in training IMAGES seen, not steps.
-# The search space (genes + ranges) is defined in src/genome.py.
-# YAML gotcha: write 1.0e-3, not 1e-3 (PyYAML reads 1e-3 as text).
+# =====================================================================
+#  Fast learners - all settings.
+#      python main.py                 -> uses run_mode below
+#      python main.py --mode full     -> overrides it
+#  YAML gotcha: write 1.0e-3, not 1e-3 (PyYAML reads 1e-3 as text).
+# =====================================================================
 
-dataset: fashion_mnist                    # fashion_mnist | mnist
+run_mode: test                    # test | quick | full
 
-# --- search ---
-methods: [GA, MAP-Elites, Optuna TPE, Random search]
-budgets: [2560, 12800, 32000, 64000, 128000]  # training images per candidate
-seeds: [0, 1]                             # independent search runs. Full: [0, 1, 2, 3, 4]
-cpg: 24                                   # candidates per generation
-generations: 5                            # full: 20  ->  cpg * generations networks per search
-top_k: 5                                  # re-check the top 5 on fresh seeds ...
-recheck_seeds: 3                          # ... the best average is the winner
+# How big each run mode is
+run_modes:
+  test:                           # a few minutes, just checks that everything works
+    budgets: [2560]               # training images per candidate during the search
+    seeds: [0]                    # independent search runs per (budget, method)
+    generations: 2                # rounds per search (each round = cpg networks)
+    epochs: 2                     # length of the final retraining (1 epoch = 50,000 images)
+    top_k: 3                      # re-check the top_k networks of each search ...
+    recheck_seeds: 1              # ... on this many fresh seeds; best average = winner
+  quick:                          # ~15 min on a GPU, first look at the results
+    budgets: [2560, 12800, 32000, 64000, 128000]
+    seeds: [0, 1]
+    generations: 5
+    epochs: 2
+    top_k: 5
+    recheck_seeds: 3
+  full:                           # the real experiment, ~3 h on a GPU
+    budgets: [2560, 12800, 32000, 64000, 128000]
+    seeds: [0, 1, 2, 3, 4]
+    generations: 20
+    epochs: 20
+    top_k: 5
+    recheck_seeds: 3
 
-# --- retraining the winners + baselines ---
-epochs: 2                                 # full: 20  (1 epoch = 50,000 images)
-final_seeds: 3                            # retrain each winner this many times, average
-eval_every: 640                           # validation accuracy every 640 images
-thresholds: [0.75, 0.80, 0.85]            # speed = images needed to reach these accuracies
-early_samples: 51200                      # "early phase" for the early AUC metric
-acc_at: 12800                             # acc@ metric = val accuracy after this many images
-good_cell_margin: 0.03                    # grid cell is "good" if within 3 points of the best
+dataset: fashion_mnist            # fashion_mnist | mnist
 
+search:
+  methods: [GA, MAP-Elites, Optuna TPE, Random search]
+  cpg: 24                         # candidates (networks) per generation
+  grid_bins: 8                    # MAP-Elites / diversity grid: learning rate x network size
+
+# The hyperparameters being searched. Each one is a "gene" in [0, 1]:
+#   log    -> min..max on a log scale     int -> whole numbers min..max
+#   choice -> one of the options (equal share each)
+# You can change ranges and options, but not add new genes (the model only knows these).
+# Keep this order - it is the order of the genes in a genome.
+search_space:
+  lr:         {type: log,    min: 1.0e-4, max: 1.0}
+  optimizer:  {type: choice, options: [sgd, adam]}
+  batch_size: {type: choice, options: [32, 64, 128]}
+  layers:     {type: choice, options: [1, 2, 3]}     # hidden layers, max 3
+  width:      {type: int,    min: 16, max: 256}      # units per hidden layer
+  activation: {type: choice, options: [relu, tanh]}
+
+# Hand-picked reference networks every winner is compared with
 baselines:
   Adam 1e-3: {lr: 1.0e-3, optimizer: adam, batch_size: 128, layers: 2, width: 128, activation: relu}
   Adam 3e-4: {lr: 3.0e-4, optimizer: adam, batch_size: 128, layers: 2, width: 128, activation: relu}
   SGD 1e-2:  {lr: 1.0e-2, optimizer: sgd,  batch_size: 128, layers: 2, width: 128, activation: relu}
+
+retrain:
+  seeds: 3                        # each winner / baseline is retrained this many times (averaged)
+  first_seed: 500                 # seeds 500, 501, 502 - same as the team notebook
+  eval_every: 640                 # validation accuracy every 640 images -> learning curve
+
+analysis:
+  thresholds: [0.75, 0.80, 0.85]  # speed = images needed to reach these validation accuracies
+  acc_at: 12800                   # "acc@": validation accuracy after this many images
+  early_images: 51200             # "early AUC": average validation accuracy over the first ... images
+  good_cell_margin: 0.03          # a grid cell is "good" if within 3 points of the best accuracy
